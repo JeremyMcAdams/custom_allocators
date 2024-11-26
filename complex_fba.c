@@ -10,7 +10,7 @@ typedef uint8_t bool;
 /*
 Complex fba is a stack based memory allocator meant for faster dynamic allocations limited to the stack.
 This allocator does consume some of the buffer's memory to track allocations without calling on the heap to increase speed at the cost of some memory.
-Currently each allocation header is 4 bytes and has the following structure
+Currently each allocation header is 4 bytes and has the following structure (yes this is a lot of memory. I will cut it down to 2 bytes later but it requires extra checks)
 
 0000 0000 0000 0000 0000 0000 0000 0  000
 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ^~ ----------------
@@ -40,6 +40,7 @@ FixedAllocator init_fba(void* buffer, unsigned bytes) {
     };
     return fba;
 }
+//This is a function to make it clearer what I'm trying to do instead of having "if (*header & 1 == false)" everywhere
 static bool is_allocated(const uint32_t* header) {
     return *header & 1;
 }
@@ -51,7 +52,7 @@ static bool is_allocated(const uint32_t* header) {
 --------------------- ------------------------  -------------------------      -------------
 |(void*) last_header| |Dedicated Memory      |  |Lost Memory < 4 bytes  |      |next_header|
 --------------------- ------------------------  -------------------------      -------------
-MEM_OFFSET------------^ *last_header >> 3----^  (*last_header >> 1) & 3-^ + 1 -^
+MEM_OFFSET------------^ *last_header >> 3----^  (*last_header >> 1) & 3-^ + 1--^
 */  
 static uint32_t align_next_header(uint32_t* header) {
     return MEM_OFFSET + (*header >> 3) + ((*header >> 1) & 3) + 1;
@@ -73,8 +74,8 @@ static uint32_t* increment_header(FixedAllocator* restrict fba, uint32_t* last_h
 }
 
 static void merge_free_blocks(uint32_t* header1, uint32_t* header2) {
-    //takes header sizes and lost memory fragments and merges them into one number
-    uint32_t new_size = (*header1 >> 3) + (((*header1 >> 1) & 3) + *header2 >> 3) + ((*header2 >> 1) & 3) + HEADER_SIZE;
+    //takes header sizes and lost memory fragments and merges them into one number. Made into a function to prevent messing up the math somewhere else
+    uint32_t new_size = (*header1 >> 3) + ((*header1 >> 1) & 3) + (*header2 >> 3) + ((*header2 >> 1) & 3) + HEADER_SIZE;
     *header2 = 0;
     *header1 = new_size << 3;
 }
@@ -93,7 +94,7 @@ static uint32_t* fba_find_mem(FixedAllocator* restrict fba, unsigned bytes) {
     if (return_header == 0 && is_allocated(current_header) == false && (*current_header >> 3)) {
         return_header = current_header;
     }
-    if (return_header == 0) { //no block free
+    else if (return_header == 0) { //no blocks are free so we do an early return to prevent null pointer dereference
         return 0;
     }
 
@@ -120,9 +121,6 @@ void* fba_malloc(FixedAllocator* restrict fba, const unsigned bytes) {
     }
     else if (fba->cur_ptr + HEADER_SIZE + bytes > fba->end_ptr) {
         uint32_t* return_header = fba_find_mem(fba, bytes);
-        if (return_header) {
-            printf("fba_malloc return_header = 0x%x\n", *return_header); 
-        }
         void* return_pointer = ((void*) return_header) + MEM_OFFSET;
         return return_pointer;
     } 
@@ -137,9 +135,9 @@ void* fba_malloc(FixedAllocator* restrict fba, const unsigned bytes) {
 }
 
 
-void fba_free(FixedAllocator* restrict fba, void* mem) {
+void* fba_free(FixedAllocator* restrict fba, void* mem) {
     if (fba->buffer + MEM_OFFSET > mem || fba->buffer + fba->end_ptr < mem) {
-        return;
+        return mem;
     }
     else {
         uint32_t* header = (mem - MEM_OFFSET);
@@ -182,18 +180,41 @@ void fba_free(FixedAllocator* restrict fba, void* mem) {
             header = fba->buffer;
             uint32_t* next_header = increment_header(fba, header);
             while ((void*) next_header < fba->buffer + fba->cur_ptr && (void*) next_header < fba->buffer + fba->end_ptr) {
-                printf("*header    = 0x%x\n", *header);
-                printf("*next_header = 0x%x\n", *next_header);
+//                printf("*header    = 0x%x\n", *header);
+//                printf("*next_header = 0x%x\n", *next_header);
                 if (is_allocated(next_header) == false && is_allocated(header) == false) {
                     merge_free_blocks(header, next_header);
-                    printf("last_header new size = %lu\n", *header >> 3);
+//                    printf("last_header new size = %lu\n", *header >> 3);
                     next_header = increment_header(fba, header);
                 }
                 header = next_header;
                 next_header = increment_header(fba, header);
             }
         }
+        return 0;
     }
+    return mem;
+}
+
+void* fba_realloc(FixedAllocator* fba, void* mem, unsigned bytes) {
+    uint32_t* new_mem_header = 0;
+    uint32_t* last_header = (uint32_t*) (mem - MEM_OFFSET);
+    uint32_t* current_header = increment_header(fba, last_header);
+    if (((*last_header >> 3) + ((*last_header >> 1) & 3)) >= bytes) {
+       //add resize if lost memory matches needed memory 
+    }
+    if (is_allocated(current_header) == false && ((*current_header >> 3) + (*last_header >> 3) + ((*last_header >> 1) & 3)) >= bytes)  {
+        //set up merging logic and place next header or lost memory
+    } 
+    while ((void*) current_header < fba->buffer + fba->cur_ptr && (void*) current_header < fba->buffer + fba->end_ptr) {
+        if (is_allocated(last_header) == false && (*last_header >> 3) >= bytes) {
+            //set header to a variable and then do some math to place new header if needed
+            break;
+        }
+        last_header = current_header;
+        current_header = increment_header(fba, last_header);
+    }
+
 }
 
 int main() {
@@ -219,15 +240,13 @@ int main() {
     printf("*string4 = 0x%x\n", *((uint32_t*)((void*) string4 - MEM_OFFSET)));
     printf("string2 = %s\n", string2);
     printf("string3 = %s\n", string3);
-    fba_free(&fba, string2);
-    fba_free(&fba, string3);
-//    printf("*string1 = 0x%x\n", *((uint32_t*)((void*) string1 - MEM_OFFSET)));
-//    printf("*string2 = 0x%x\n", *((uint32_t*)((void*) string2 - MEM_OFFSET)));
-//    printf("*string3 = 0x%x\n", *((uint32_t*)((void*) string3 - MEM_OFFSET)));
-//    printf("*string4 = 0x%x\n", *((uint32_t*)((void*) string4 - MEM_OFFSET)));
+    string2 = fba_free(&fba, string2);
+    string3 = fba_free(&fba, string3);
+    printf("string2 = %lu\n", string2);
+    printf("string3 = %lu\n", string3);
     string6 = fba_malloc(&fba, 27 * sizeof(char));
     strncpy(string6, "This is a sample string", fba_get_size(&fba, string6));
-    printf("string6 using string2 address = %s\n", string2);
+    printf("string6 = %s\n", string6);
     printf("string6 = %lu\n", string6);
     
     return 0;
